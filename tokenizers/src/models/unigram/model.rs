@@ -51,6 +51,34 @@ impl<'a> PreparedDP<'a> {
         best[self.len]
     }
 
+    /// Like `score_only_f32`, but also returns the number of tokens in the best path.
+    #[inline]
+    pub fn score_and_count_f32(&self, weights: &[f32], unk_id: usize, unk_score: f32) -> (f32, u32) {
+        if self.len == 0 {
+            return (0.0, 0);
+        }
+        let mut best = vec![f32::NEG_INFINITY; self.len + 1];
+        let mut count = vec![0u32; self.len + 1];
+        best[0] = 0.0;
+
+        for s in 0..self.len {
+            let base = best[s];
+            if base == f32::NEG_INFINITY {
+                continue;
+            }
+            let base_count = count[s];
+            for &(e, id) in &self.edges[s] {
+                let w = if id == unk_id { unk_score } else { unsafe { *weights.get_unchecked(id) } };
+                let sc = base + w;
+                if sc > best[e] {
+                    best[e] = sc;
+                    count[e] = base_count + 1;
+                }
+            }
+        }
+        (best[self.len], count[self.len])
+    }
+
     /// Compute score and the best tokenization; fuses consecutive UNKs if requested.
     pub fn tokens_and_score_f32(
         &self,
@@ -578,6 +606,139 @@ impl Unigram {
 
         sentences.par_iter()
             .map(|sentence| self.best_of_cached_weight_sets(sentence.as_str()))
+            .collect()
+    }
+
+    /// Top-k languages by raw summed score (no bias). Returns up to k (idx, score)
+    /// pairs sorted descending. Used to fit a learned per-language bias offline.
+    pub fn top_k_of_cached_weight_sets(&self, sentence: &str, k: usize) -> Result<Vec<(usize, f32)>> {
+        let sets = self
+            .cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+        if sentence.is_empty() || sets.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let unk_id = self.unk_id.ok_or(UnigramError::MissingUnkId)?;
+        let unk_score = (self.min_score - K_UNK_PENALTY) as f32;
+        let prep = self.prepare_dp(sentence);
+        let mut scored: Vec<(usize, f32)> = sets
+            .iter()
+            .enumerate()
+            .map(|(i, ws)| (i, prep.score_only_f32(ws, unk_id, unk_score)))
+            .collect();
+        let kk = k.min(scored.len());
+        scored.select_nth_unstable_by(kk - 1, |a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(kk);
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scored)
+    }
+
+    /// Batch version of top_k_of_cached_weight_sets using Rayon.
+    pub fn top_k_of_cached_weight_sets_batch(&self, sentences: &[String], k: usize) -> Result<Vec<Vec<(usize, f32)>>> {
+        use rayon::prelude::*;
+        self.cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+        sentences.par_iter()
+            .map(|sentence| self.top_k_of_cached_weight_sets(sentence.as_str(), k))
+            .collect()
+    }
+
+    /// Like `best_of_cached_weight_sets`, but adds a per-language bias `biases[i]`
+    /// (a language prior / calibration offset) to each language's summed score
+    /// before the argmax. `biases` shorter than the weight sets is padded with 0.
+    pub fn best_of_cached_weight_sets_biased(&self, sentence: &str, biases: &[f32]) -> Result<(usize, Vec<String>, f32)> {
+        let sets = self
+            .cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+        if sentence.is_empty() {
+            return Ok((0, Vec::new(), 0.0));
+        }
+        let unk_id = self.unk_id.ok_or(UnigramError::MissingUnkId)?;
+        let unk_score = (self.min_score - K_UNK_PENALTY) as f32;
+        let prep = self.prepare_dp(sentence);
+        let mut best_i = 0usize;
+        let mut best_s = f32::NEG_INFINITY;
+        for (i, ws) in sets.iter().enumerate() {
+            let b = if i < biases.len() { biases[i] } else { 0.0 };
+            let s = prep.score_only_f32(ws, unk_id, unk_score) + b;
+            if s > best_s {
+                best_s = s;
+                best_i = i;
+            }
+        }
+        let (tokens, score) = if sets.is_empty() {
+            prep.tokens_and_score_f32(&[], unk_id, unk_score, self.fuse_unk)
+        } else {
+            prep.tokens_and_score_f32(&sets[best_i], unk_id, unk_score, self.fuse_unk)
+        };
+        Ok((best_i, tokens, score))
+    }
+
+    /// Batch version of best_of_cached_weight_sets_biased using Rayon.
+    pub fn best_of_cached_weight_sets_biased_batch(&self, sentences: &[String], biases: &[f32]) -> Result<Vec<(usize, Vec<String>, f32)>> {
+        use rayon::prelude::*;
+        self.cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+        sentences.par_iter()
+            .map(|sentence| self.best_of_cached_weight_sets_biased(sentence.as_str(), biases))
+            .collect()
+    }
+
+    /// Like `best_of_cached_weight_sets`, but selects the winner by
+    /// **length-normalized** score (score / n_tokens) instead of raw score.
+    /// Returns (winner_index, tokens, normalized_score_f32).
+    ///
+    /// Note: n_tokens is the number of edges in the Viterbi best path (before
+    /// UNK fusion), so `len(tokens) * normalized_score != raw_score` when
+    /// consecutive UNKs are fused.
+    pub fn best_of_cached_weight_sets_normalized(&self, sentence: &str, alpha: f32) -> Result<(usize, Vec<String>, f32)> {
+        let sets = self
+            .cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if sentence.is_empty() {
+            return Ok((0, Vec::new(), 0.0));
+        }
+        let unk_id = self.unk_id.ok_or(UnigramError::MissingUnkId)?;
+        let unk_score = (self.min_score - K_UNK_PENALTY) as f32;
+
+        let prep = self.prepare_dp(sentence);
+
+        // Pass 1: score + count, compare normalized by count^alpha
+        let mut best_i = 0usize;
+        let mut best_norm = f32::NEG_INFINITY;
+        for (i, ws) in sets.iter().enumerate() {
+            let (s, c) = prep.score_and_count_f32(ws, unk_id, unk_score);
+            let norm = if c > 0 { s / (c as f32).powf(alpha) } else { f32::NEG_INFINITY };
+            if norm > best_norm {
+                best_norm = norm;
+                best_i = i;
+            }
+        }
+        // Pass 2: tokens for the winner
+        let (tokens, _raw_score) = if sets.is_empty() {
+            prep.tokens_and_score_f32(&[], unk_id, unk_score, self.fuse_unk)
+        } else {
+            prep.tokens_and_score_f32(&sets[best_i], unk_id, unk_score, self.fuse_unk)
+        };
+        Ok((best_i, tokens, best_norm))
+    }
+
+    /// Batch version of best_of_cached_weight_sets_normalized using Rayon.
+    pub fn best_of_cached_weight_sets_normalized_batch(&self, sentences: &[String], alpha: f32) -> Result<Vec<(usize, Vec<String>, f32)>> {
+        use rayon::prelude::*;
+
+        self.cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        sentences.par_iter()
+            .map(|sentence| self.best_of_cached_weight_sets_normalized(sentence.as_str(), alpha))
             .collect()
     }
 

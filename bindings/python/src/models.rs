@@ -758,6 +758,84 @@ impl PyUnigram {
         }
     }
 
+    /// Biased batch version: adds per-language bias `biases[i]` (a language prior)
+    /// to each language's score before the argmax. Returns (idx, tokens, score).
+    #[pyo3(text_signature = "(self, texts, biases)")]
+    fn best_of_cached_weight_sets_biased_batch(
+        self_: PyRef<Self>,
+        texts: Vec<String>,
+        biases: Vec<f32>,
+    ) -> PyResult<Vec<(usize, Vec<String>, f32)>> {
+        let super_ = self_.as_ref();
+        let model_guard = super_.model.read().unwrap();
+        if let ModelWrapper::Unigram(ref uni) = *model_guard {
+            uni.best_of_cached_weight_sets_biased_batch(&texts, &biases)
+                .map_err(|e| exceptions::PyException::new_err(format!("{e}")))
+        } else {
+            Err(exceptions::PyException::new_err(
+                "best_of_cached_weight_sets_biased_batch is only available for Unigram",
+            ))
+        }
+    }
+
+    /// Top-k batch version: returns, per text, a list of (idx, score) for the top-k
+    /// languages by raw score (no bias). Used to fit a learned per-language bias.
+    #[pyo3(text_signature = "(self, texts, k)")]
+    fn top_k_of_cached_weight_sets_batch(
+        self_: PyRef<Self>,
+        texts: Vec<String>,
+        k: usize,
+    ) -> PyResult<Vec<Vec<(usize, f32)>>> {
+        let super_ = self_.as_ref();
+        let model_guard = super_.model.read().unwrap();
+        if let ModelWrapper::Unigram(ref uni) = *model_guard {
+            uni.top_k_of_cached_weight_sets_batch(&texts, k)
+                .map_err(|e| exceptions::PyException::new_err(format!("{e}")))
+        } else {
+            Err(exceptions::PyException::new_err(
+                "top_k_of_cached_weight_sets_batch is only available for Unigram",
+            ))
+        }
+    }
+
+    /// Length-normalized version: selects winner by score/n_tokens^alpha.
+    #[pyo3(signature = (text, alpha = 1.0))]
+    fn best_of_cached_weight_sets_normalized(
+        self_: PyRef<Self>,
+        text: &str,
+        alpha: f32,
+    ) -> PyResult<(usize, Vec<String>, f32)> {
+        let super_ = self_.as_ref();
+        let model_guard = super_.model.read().unwrap();
+        if let ModelWrapper::Unigram(ref uni) = *model_guard {
+            uni.best_of_cached_weight_sets_normalized(text, alpha)
+                .map_err(|e| exceptions::PyException::new_err(format!("{e}")))
+        } else {
+            Err(exceptions::PyException::new_err(
+                "best_of_cached_weight_sets_normalized is only available for Unigram",
+            ))
+        }
+    }
+
+    /// Batch version of length-normalized scoring.
+    #[pyo3(signature = (texts, alpha = 1.0))]
+    fn best_of_cached_weight_sets_normalized_batch(
+        self_: PyRef<Self>,
+        texts: Vec<String>,
+        alpha: f32,
+    ) -> PyResult<Vec<(usize, Vec<String>, f32)>> {
+        let super_ = self_.as_ref();
+        let model_guard = super_.model.read().unwrap();
+        if let ModelWrapper::Unigram(ref uni) = *model_guard {
+            uni.best_of_cached_weight_sets_normalized_batch(&texts, alpha)
+                .map_err(|e| exceptions::PyException::new_err(format!("{e}")))
+        } else {
+            Err(exceptions::PyException::new_err(
+                "best_of_cached_weight_sets_normalized_batch is only available for Unigram",
+            ))
+        }
+    }
+
     /// Clears the internal cache
     #[pyo3(signature = ())]
     #[pyo3(text_signature = "(self)")]
