@@ -213,6 +213,10 @@ pub enum UnigramError {
     MismatchedWeightLength { expected: usize, got: usize },
     #[error("No cached weight sets have been provided")]
     NoCachedWeights,
+    #[error("Weight set index {index} is out of range: only {num_sets} cached weight sets are available")]
+    WeightSetIndexOutOfRange { index: usize, num_sets: usize },
+    #[error("Batch length mismatch: {sentences} sentences but {indices} indices")]
+    MismatchedBatchLength { sentences: usize, indices: usize },
 }
 
 impl Default for Unigram {
@@ -739,6 +743,49 @@ impl Unigram {
 
         sentences.par_iter()
             .map(|sentence| self.best_of_cached_weight_sets_normalized(sentence.as_str(), alpha))
+            .collect()
+    }
+
+    /// Like `best_of_cached_weight_sets`, but returns the tokens and score for a
+    /// caller-specified weight set `index` instead of the argmax over all cached
+    /// weight sets. Useful when the winning language has already been chosen
+    /// (e.g. by an external classifier) and only its segmentation is needed.
+    pub fn tokens_of_cached_weight_set(&self, sentence: &str, index: usize) -> Result<(Vec<String>, f32)> {
+        let sets = self
+            .cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+        if index >= sets.len() {
+            return Err(Box::new(UnigramError::WeightSetIndexOutOfRange {
+                index,
+                num_sets: sets.len(),
+            }));
+        }
+        if sentence.is_empty() {
+            return Ok((Vec::new(), 0.0));
+        }
+        let unk_id = self.unk_id.ok_or(UnigramError::MissingUnkId)?;
+        let unk_score = (self.min_score - K_UNK_PENALTY) as f32;
+        let prep = self.prepare_dp(sentence);
+        Ok(prep.tokens_and_score_f32(&sets[index], unk_id, unk_score, self.fuse_unk))
+    }
+
+    /// Batch version of tokens_of_cached_weight_set using Rayon.
+    pub fn tokens_of_cached_weight_set_batch(&self, sentences: &[String], indices: &[usize]) -> Result<Vec<(Vec<String>, f32)>> {
+        use rayon::prelude::*;
+        self.cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+        if sentences.len() != indices.len() {
+            return Err(Box::new(UnigramError::MismatchedBatchLength {
+                sentences: sentences.len(),
+                indices: indices.len(),
+            }));
+        }
+        sentences
+            .par_iter()
+            .zip(indices.par_iter())
+            .map(|(sentence, &index)| self.tokens_of_cached_weight_set(sentence.as_str(), index))
             .collect()
     }
 

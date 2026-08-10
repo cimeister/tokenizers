@@ -798,6 +798,26 @@ impl PyUnigram {
         }
     }
 
+    /// Batch version: returns, per (text, index) pair, the tokens and score for the
+    /// caller-specified cached weight set `index` (instead of the argmax language).
+    #[pyo3(text_signature = "(self, texts, indices)")]
+    fn tokens_of_cached_weight_set_batch(
+        self_: PyRef<Self>,
+        texts: Vec<String>,
+        indices: Vec<usize>,
+    ) -> PyResult<Vec<(Vec<String>, f32)>> {
+        let super_ = self_.as_ref();
+        let model_guard = super_.model.read().unwrap();
+        if let ModelWrapper::Unigram(ref uni) = *model_guard {
+            uni.tokens_of_cached_weight_set_batch(&texts, &indices)
+                .map_err(|e| exceptions::PyException::new_err(format!("{e}")))
+        } else {
+            Err(exceptions::PyException::new_err(
+                "tokens_of_cached_weight_set_batch is only available for Unigram",
+            ))
+        }
+    }
+
     /// Length-normalized version: selects winner by score/n_tokens^alpha.
     #[pyo3(signature = (text, alpha = 1.0))]
     fn best_of_cached_weight_sets_normalized(
