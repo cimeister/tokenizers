@@ -707,6 +707,31 @@ impl PyUnigram {
         }
     }
 
+    /// Cache weight sets from a 2D numpy float32 array (zero-copy path).
+    /// Avoids the expensive .tolist() → Vec<Vec<f64>> → f32 conversion.
+    #[pyo3(text_signature = "(self, weight_sets)")]
+    fn set_weight_sets_numpy(
+        self_: PyRefMut<Self>,
+        weight_sets: numpy::PyReadonlyArray2<f32>,
+    ) -> PyResult<()> {
+        let super_ = self_.as_ref();
+        let mut model = super_.model.write().unwrap();
+        if let ModelWrapper::Unigram(ref mut uni) = *model {
+            let array = weight_sets.as_array();
+            let sets: Vec<Box<[f32]>> = array
+                .rows()
+                .into_iter()
+                .map(|row| row.to_vec().into_boxed_slice())
+                .collect();
+            uni.set_weight_sets_f32(sets)
+                .map_err(|e| exceptions::PyException::new_err(format!("{e}")))
+        } else {
+            Err(exceptions::PyException::new_err(
+                "set_weight_sets_numpy is only available for Unigram",
+            ))
+        }
+    }
+
     #[pyo3(text_signature = "(self)")]
     fn clear_weight_sets(self_: PyRefMut<Self>) -> PyResult<()> {
         let super_ = self_.as_ref();
@@ -852,6 +877,42 @@ impl PyUnigram {
         } else {
             Err(exceptions::PyException::new_err(
                 "best_of_cached_weight_sets_normalized_batch is only available for Unigram",
+            ))
+        }
+    }
+
+    /// Forward algorithm: select best language by marginalizing over all segmentations.
+    #[pyo3(text_signature = "(self, text)")]
+    fn best_of_cached_weight_sets_forward(
+        self_: PyRef<Self>,
+        text: &str,
+    ) -> PyResult<(usize, Vec<String>, f32)> {
+        let super_ = self_.as_ref();
+        let model_guard = super_.model.read().unwrap();
+        if let ModelWrapper::Unigram(ref uni) = *model_guard {
+            uni.best_of_cached_weight_sets_forward(text)
+                .map_err(|e| exceptions::PyException::new_err(format!("{e}")))
+        } else {
+            Err(exceptions::PyException::new_err(
+                "best_of_cached_weight_sets_forward is only available for Unigram",
+            ))
+        }
+    }
+
+    /// Batch forward algorithm with Rayon parallelism.
+    #[pyo3(text_signature = "(self, texts)")]
+    fn best_of_cached_weight_sets_forward_batch(
+        self_: PyRef<Self>,
+        texts: Vec<String>,
+    ) -> PyResult<Vec<(usize, Vec<String>, f32)>> {
+        let super_ = self_.as_ref();
+        let model_guard = super_.model.read().unwrap();
+        if let ModelWrapper::Unigram(ref uni) = *model_guard {
+            uni.best_of_cached_weight_sets_forward_batch(&texts)
+                .map_err(|e| exceptions::PyException::new_err(format!("{e}")))
+        } else {
+            Err(exceptions::PyException::new_err(
+                "best_of_cached_weight_sets_forward_batch is only available for Unigram",
             ))
         }
     }

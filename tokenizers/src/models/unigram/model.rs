@@ -15,6 +15,20 @@ use std::path::{Path, PathBuf};
 type TokenMap = AHashMap<String, u32>;
 type Vocab = Vec<(String, f64)>;
 
+/// Numerically stable log-sum-exp for two f32 values in log-space.
+#[inline(always)]
+fn log_sum_exp_f32(a: f32, b: f32) -> f32 {
+    if a == f32::NEG_INFINITY {
+        return b;
+    }
+    if b == f32::NEG_INFINITY {
+        return a;
+    }
+    let max = if a > b { a } else { b };
+    let min = if a > b { b } else { a };
+    max + (min - max).exp().ln_1p()
+}
+
 /// A precomputed forward graph over one sentence:
 /// edges[s] = list of (end_pos, vocab_id) matches starting at byte offset s.
 /// Includes the UNK fallback edge at s if no mblen-token exists.
@@ -77,6 +91,36 @@ impl<'a> PreparedDP<'a> {
             }
         }
         (best[self.len], count[self.len])
+    }
+
+    /// Forward algorithm: compute log p(s|l) by marginalizing over all segmentations.
+    /// Uses log-sum-exp instead of max, giving the total probability of the string
+    /// under the language model rather than just the best segmentation's probability.
+    #[inline]
+    pub fn forward_score_f32(&self, weights: &[f32], unk_id: usize, unk_score: f32) -> f32 {
+        if self.len == 0 {
+            return 0.0;
+        }
+        let mut alpha = vec![f32::NEG_INFINITY; self.len + 1];
+        alpha[0] = 0.0;
+
+        for s in 0..self.len {
+            let base = alpha[s];
+            if base == f32::NEG_INFINITY {
+                continue;
+            }
+            for &(e, id) in &self.edges[s] {
+                let w = if id == unk_id {
+                    unk_score
+                } else {
+                    unsafe { *weights.get_unchecked(id) }
+                };
+                let sc = base + w;
+                // log-sum-exp: alpha[e] = log(exp(alpha[e]) + exp(sc))
+                alpha[e] = log_sum_exp_f32(alpha[e], sc);
+            }
+        }
+        alpha[self.len]
     }
 
     /// Compute score and the best tokenization; fuses consecutive UNKs if requested.
@@ -555,6 +599,23 @@ impl Unigram {
         Ok(())
     }
 
+    /// Keep (or replace) language weight sets already in f32 (zero-conversion path).
+    pub fn set_weight_sets_f32(&mut self, sets: Vec<Box<[f32]>>) -> Result<()> {
+        if sets.is_empty() {
+            self.cached_weight_sets = Some(Vec::new());
+            return Ok(());
+        }
+        let v = self.vocab.len();
+        if !sets.iter().all(|w| w.len() == v) {
+            return Err(Box::new(UnigramError::MismatchedWeightLength {
+                expected: v,
+                got: sets[0].len(),
+            }));
+        }
+        self.cached_weight_sets = Some(sets);
+        Ok(())
+    }
+
     pub fn clear_weight_sets(&mut self) {
         self.cached_weight_sets = None;
     }
@@ -786,6 +847,55 @@ impl Unigram {
             .par_iter()
             .zip(indices.par_iter())
             .map(|(sentence, &index)| self.tokens_of_cached_weight_set(sentence.as_str(), index))
+            .collect()
+    }
+
+    /// Forward algorithm variant: select best language by marginalizing over all
+    /// segmentations (log-sum-exp) instead of taking only the Viterbi-best.
+    /// Returns (winner_index, tokens_from_viterbi, forward_score).
+    pub fn best_of_cached_weight_sets_forward(&self, sentence: &str) -> Result<(usize, Vec<String>, f32)> {
+        let sets = self
+            .cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if sentence.is_empty() {
+            return Ok((0, Vec::new(), 0.0));
+        }
+        let unk_id = self.unk_id.ok_or(UnigramError::MissingUnkId)?;
+        let unk_score = (self.min_score - K_UNK_PENALTY) as f32;
+
+        let prep = self.prepare_dp(sentence);
+
+        // Pass 1: forward score (marginalize over all segmentations)
+        let mut best_i = 0usize;
+        let mut best_s = f32::NEG_INFINITY;
+        for (i, ws) in sets.iter().enumerate() {
+            let s = prep.forward_score_f32(ws, unk_id, unk_score);
+            if s > best_s {
+                best_s = s;
+                best_i = i;
+            }
+        }
+        // Pass 2: Viterbi tokens for the winner (for display/debugging)
+        let (tokens, _viterbi_score) = if sets.is_empty() {
+            prep.tokens_and_score_f32(&[], unk_id, unk_score, self.fuse_unk)
+        } else {
+            prep.tokens_and_score_f32(&sets[best_i], unk_id, unk_score, self.fuse_unk)
+        };
+        Ok((best_i, tokens, best_s))
+    }
+
+    /// Batch version of best_of_cached_weight_sets_forward using Rayon.
+    pub fn best_of_cached_weight_sets_forward_batch(&self, sentences: &[String]) -> Result<Vec<(usize, Vec<String>, f32)>> {
+        use rayon::prelude::*;
+
+        self.cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        sentences.par_iter()
+            .map(|sentence| self.best_of_cached_weight_sets_forward(sentence.as_str()))
             .collect()
     }
 
